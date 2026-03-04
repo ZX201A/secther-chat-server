@@ -1,12 +1,115 @@
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 
 const PORT = process.env.PORT || 8080;
 
+// ─── Persistent Storage ─────────────────────────────────────────────────────────
+const PERSISTENT_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
+console.log(`[Storage] Using persistent directory: ${PERSISTENT_DIR} - index.js:10`);
+
+// ─── File Upload & Static Files Server ──────────────────────────────────────────
+const UPLOAD_DIR = path.join(PERSISTENT_DIR, 'uploads');
+
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  console.log(`[Upload] Created uploads directory - index.js:17`);
+}
+
+// Combined HTTP server for file uploads and static files
+const server = http.createServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+
+  // File upload endpoint
+  if (req.method === 'POST' && req.url === '/upload') {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      try {
+        const buffer = Buffer.concat(chunks);
+        
+        let contentType = 'application/octet-stream';
+        if (buffer[0] === 0xFF && buffer[1] === 0xD8) {
+          contentType = 'image/jpeg';
+        } else if (buffer[0] === 0x89 && buffer[1] === 0x50) {
+          contentType = 'image/png';
+        } else if (buffer[0] === 0x47 && buffer[1] === 0x49) {
+          contentType = 'image/gif';
+        }
+
+        const ext = contentType.split('/')[1] || 'bin';
+        const filename = `${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
+        const filepath = path.join(UPLOAD_DIR, filename);
+
+        fs.writeFileSync(filepath, buffer);
+        
+        // Return full URL for Railway deployment
+        const host = req.headers['host'] || 'secther-chat-server-production.up.railway.app';
+        const protocol = req.headers['x-forwarded-proto'] || 'https';
+        const fileUrl = `${protocol}://${host}/uploads/${filename}`;
+        
+        console.log(`[Upload] File saved: ${filename} - index.js:60`);
+        
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, url: fileUrl, filename: filename }));
+      } catch (e) {
+        console.error('[Upload] Error: - index.js:65', e.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // Serve uploaded files
+  if (req.method === 'GET' && req.url.startsWith('/uploads/')) {
+    const filename = req.url.split('/').pop();
+    const filepath = path.join(UPLOAD_DIR, filename);
+    
+    if (fs.existsSync(filepath)) {
+      const ext = path.extname(filename).toLowerCase();
+      const contentTypes = {
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png',
+        '.gif': 'image/gif',
+        '.mp3': 'audio/mpeg',
+        '.mp4': 'video/mp4',
+        '.pdf': 'application/pdf',
+      };
+      
+      res.writeHead(200, { 
+        'Content-Type': contentTypes[ext] || 'application/octet-stream',
+        'Access-Control-Allow-Origin': '*'
+      });
+      fs.createReadStream(filepath).pipe(res);
+      return;
+    }
+  }
+
+  // Health check endpoint
+  if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', users: users ? users.size : 0, online: activeConnections ? activeConnections.size : 0 }));
+    return;
+  }
+
+  res.writeHead(404);
+  res.end('Not Found');
+});
+
 // ─── Persistent User Registry ─────────────────────────────────────────────────
-const USERS_FILE = path.join(__dirname, 'users_registry.json');
-const INACTIVITY_HOURS = 48; // Delete user after 48 hours of inactivity
+const USERS_FILE = path.join(PERSISTENT_DIR, 'users_registry.json');
+const INACTIVITY_HOURS = 30 * 24;
 
 function loadUsers() {
   try {
@@ -17,11 +120,11 @@ function loadUsers() {
       for (const [username, info] of Object.entries(parsed)) {
         map.set(username, info);
       }
-      console.log(`[Registry] Loaded ${map.size} users - index.js:20`);
+      console.log(`[Registry] Loaded ${map.size} users - index.js:123`);
       return map;
     }
   } catch (e) {
-    console.error('[Registry] Failed to load: - index.js:24', e.message);
+    console.error('[Registry] Failed to load: - index.js:127', e.message);
   }
   return new Map();
 }
@@ -33,6 +136,7 @@ function saveUsers() {
       obj[username] = {
         id: info.id,
         username: username,
+        accountId: info.accountId || '',
         publicKey: info.publicKey,
         registeredAt: info.registeredAt || new Date().toISOString(),
         lastSeen: info.lastSeen || new Date().toISOString(),
@@ -40,7 +144,7 @@ function saveUsers() {
     }
     fs.writeFileSync(USERS_FILE, JSON.stringify(obj, null, 2), 'utf8');
   } catch (e) {
-    console.error('[Registry] Failed to save: - index.js:43', e.message);
+    console.error('[Registry] Failed to save: - index.js:147', e.message);
   }
 }
 
@@ -48,10 +152,13 @@ function deleteUser(username) {
   const info = users.get(username);
   if (info) {
     userIdToUsername.delete(info.id);
+    if (info.accountId) {
+      accountIdToUsername.delete(info.accountId);
+    }
     activeConnections.delete(info.id);
     users.delete(username);
     saveUsers();
-    console.log(`[Registry] Deleted user: ${username} - index.js:54`);
+    console.log(`[Registry] Deleted user: ${username} - index.js:161`);
     return true;
   }
   return false;
@@ -68,14 +175,12 @@ function updateLastSeen(uid) {
   }
 }
 
-// ─── 48-Hour Inactivity Cleanup ───────────────────────────────────────────────
 function cleanupInactiveUsers() {
   const now = Date.now();
   const cutoff = INACTIVITY_HOURS * 60 * 60 * 1000;
   let deleted = 0;
 
   for (const [username, info] of users.entries()) {
-    // Skip currently active users
     if (activeConnections.has(info.id)) continue;
 
     const lastSeen = info.lastSeen ? new Date(info.lastSeen).getTime() : 0;
@@ -89,30 +194,38 @@ function cleanupInactiveUsers() {
   }
 
   if (deleted > 0) {
-    console.log(`[Cleanup] Deleted ${deleted} inactive users (48h+) - index.js:92`);
+    console.log(`[Cleanup] Deleted ${deleted} inactive users (30 days+) - index.js:197`);
     saveUsers();
   }
 }
 
 // ─── In-Memory State ──────────────────────────────────────────────────────────
 const users = loadUsers();
-const activeConnections = new Map();   // userId -> WebSocket
-const userIdToUsername = new Map();    // userId -> username
+const activeConnections = new Map();
+const userIdToUsername = new Map();
+const accountIdToUsername = new Map();
 
-// Rebuild reverse lookup
 for (const [username, info] of users.entries()) {
   userIdToUsername.set(info.id, username);
+  if (info.accountId) {
+    accountIdToUsername.set(info.accountId, username);
+  }
 }
 
-// ─── WebSocket Server ─────────────────────────────────────────────────────────
-const wss = new WebSocket.Server({ port: PORT, host: '0.0.0.0' });
+// ─── Start HTTP Server ────────────────────────────────────────────────────────
+server.listen(PORT, () => {
+  console.log(`[HTTP] Server running on port ${PORT} - index.js:217`);
+});
 
-console.log(`[Server] SecTher Chat Server running on port ${PORT} - index.js:110`);
-console.log(`[Server] ${users.size} registered users in registry - index.js:111`);
+// ─── WebSocket Server ─────────────────────────────────────────────────────────
+const wss = new WebSocket.Server({ server });
+
+console.log(`[Server] SecTher Server running on port ${PORT} - index.js:223`);
+console.log(`[Server] ${users.size} registered users in registry - index.js:224`);
 
 wss.on('connection', (ws, req) => {
   const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  console.log(`[Connect] New connection from: ${clientIp} - index.js:115`);
+  console.log(`[Connect] New connection from: ${clientIp} - index.js:228`);
 
   let userId = null;
   let username = null;
@@ -127,12 +240,10 @@ wss.on('connection', (ws, req) => {
     try {
       const message = JSON.parse(data.toString());
 
-      // Update last seen on any activity
       if (userId) updateLastSeen(userId);
 
       switch (message.type) {
 
-        // ── Register / Re-register ────────────────────────────────────────
         case 'register': {
           if (!message.username || !message.userId || !message.publicKey) {
             ws.send(JSON.stringify({ type: 'error', message: 'Missing required fields' }));
@@ -147,19 +258,24 @@ wss.on('connection', (ws, req) => {
 
           username = message.username;
           userId = message.userId;
+          const accountId = message.accountId || '';
 
           users.set(username, {
             id: userId,
+            accountId: accountId,
             publicKey: message.publicKey,
             registeredAt: existing?.registeredAt || new Date().toISOString(),
             lastSeen: new Date().toISOString(),
           });
           userIdToUsername.set(userId, username);
+          if (accountId) {
+            accountIdToUsername.set(accountId, username);
+          }
           saveUsers();
 
           activeConnections.set(userId, ws);
 
-          console.log(`[Register] ${username} (${userId}) - index.js:162`);
+          console.log(`[Register] ${username} (${userId}) AccountID: ${accountId} - index.js:278`);
 
           ws.send(JSON.stringify({
             type: 'registered',
@@ -172,93 +288,110 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
-        // ── Delete Account ────────────────────────────────────────────────
         case 'delete_account': {
           if (!userId || !username) return;
-          console.log(`[Delete] Account deleted: ${username} - index.js:178`);
+          console.log(`[Delete] Account deleted: ${username} - index.js:293`);
+          
+          const deletedUserInfo = {
+            userId: userId,
+            username: username,
+            accountId: users.get(username)?.accountId || '',
+          };
+          
+          _broadcastUserDeleted(deletedUserInfo);
           _broadcastOnlineStatus(userId, username, false);
           deleteUser(username);
           ws.send(JSON.stringify({ type: 'account_deleted', success: true }));
           break;
         }
 
-        // ── Search by Username ────────────────────────────────────────────
-        case 'search_user': {
-          const query = (message.username || '').toLowerCase().trim();
-          if (!query) {
-            ws.send(JSON.stringify({ type: 'search_result', found: false }));
-            return;
-          }
-
-          let found = null;
-          // Exact match first
-          for (const [un, u] of users.entries()) {
-            if (un.toLowerCase() === query) {
-              found = { username: un, ...u };
-              break;
-            }
-          }
-          // Partial match
-          if (!found) {
-            for (const [un, u] of users.entries()) {
-              if (un.toLowerCase().includes(query)) {
-                found = { username: un, ...u };
-                break;
-              }
-            }
-          }
-
-          if (found) {
-            ws.send(JSON.stringify({
-              type: 'search_result',
-              found: true,
-              userId: found.id,
-              username: found.username,
-              publicKey: found.publicKey,
-              online: activeConnections.has(found.id),
-            }));
-          } else {
-            ws.send(JSON.stringify({ type: 'search_result', found: false }));
-          }
-          break;
-        }
-
-        // ── Search by User ID ─────────────────────────────────────────────
         case 'search_user_by_id': {
-          const searchId = (message.userId || '').trim();
-          if (!searchId) {
-            ws.send(JSON.stringify({ type: 'search_result_by_id', found: false }));
+          const query = (message.accountId || '').trim();
+          if (!query) {
+            ws.send(JSON.stringify({ type: 'search_result_by_id', found: false, error: 'Account ID required' }));
             return;
           }
 
-          const foundUsername = userIdToUsername.get(searchId);
+          // First try exact accountId match
+          let foundUsername = accountIdToUsername.get(query);
+          let found = null;
+
           if (foundUsername) {
-            const u = users.get(foundUsername);
+            found = users.get(foundUsername);
             ws.send(JSON.stringify({
               type: 'search_result_by_id',
               found: true,
-              userId: searchId,
+              userId: found.id,
+              accountId: found.accountId || '',
               username: foundUsername,
-              publicKey: u?.publicKey || '',
-              online: activeConnections.has(searchId),
+              publicKey: found?.publicKey || '',
+              online: activeConnections.has(found.id),
             }));
-          } else {
-            ws.send(JSON.stringify({ type: 'search_result_by_id', found: false }));
+            return;
           }
+
+          // Also search by username (partial match)
+          const lowerQuery = query.toLowerCase();
+          for (const [username, userInfo] of users.entries()) {
+            if (username.toLowerCase().includes(lowerQuery)) {
+              ws.send(JSON.stringify({
+                type: 'search_result_by_id',
+                found: true,
+                userId: userInfo.id,
+                accountId: userInfo.accountId || '',
+                username: username,
+                publicKey: userInfo.publicKey || '',
+                online: activeConnections.has(userInfo.id),
+              }));
+              return;
+            }
+          }
+
+          // Also search by userId
+          const foundByUserId = userIdToUsername.get(query);
+          if (foundByUserId) {
+            const u = users.get(foundByUserId);
+            ws.send(JSON.stringify({
+              type: 'search_result_by_id',
+              userId: u?.id || query,
+              accountId: u?.accountId || '',
+              username: foundByUserId,
+              publicKey: u?.publicKey || '',
+              online: activeConnections.has(u?.id),
+            }));
+            return;
+          }
+
+          // User not found
+          ws.send(JSON.stringify({ type: 'search_result_by_id', found: false, error: 'User not found' }));
           break;
         }
 
-        // ── Legacy search ─────────────────────────────────────────────────
         case 'search': {
-          const q = (message.query || '').toLowerCase();
+          const q = (message.query || '').trim();
           const results = [];
-          for (const [un, u] of users.entries()) {
-            if (un.toLowerCase().includes(q) || u.id.toLowerCase().includes(q)) {
+          
+          if (q.length > 0) {
+            const byUserId = userIdToUsername.get(q);
+            if (byUserId) {
+              const u = users.get(byUserId);
               results.push({
-                username: un,
-                userId: u.id,
-                publicKey: u.publicKey,
-                online: activeConnections.has(u.id),
+                username: byUserId,
+                userId: u?.id || q,
+                accountId: u?.accountId || '',
+                publicKey: u?.publicKey || '',
+                online: activeConnections.has(u?.id || q),
+              });
+            }
+            const byAccountId = accountIdToUsername.get(q);
+            if (byAccountId && byAccountId !== byUserId) {
+              const u = users.get(byAccountId);
+              results.push({
+                username: byAccountId,
+                userId: u?.id || '',
+                accountId: q,
+                publicKey: u?.publicKey || '',
+                online: activeConnections.has(u?.id),
               });
             }
           }
@@ -266,7 +399,6 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
-        // ── Relay Message (NO storage) ────────────────────────────────────
         case 'message': {
           if (!message.toUserId || !message.encryptedContent || !message.encryptedAESKey) {
             ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
@@ -296,7 +428,6 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
-        // ── Message Status ────────────────────────────────────────────────
         case 'message_status': {
           const targetWs = activeConnections.get(message.toUserId);
           if (targetWs && targetWs.readyState === WebSocket.OPEN) {
@@ -310,7 +441,6 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
-        // ── Delete Message ────────────────────────────────────────────────
         case 'delete_message': {
           if (message.toUserId) {
             const targetWs = activeConnections.get(message.toUserId);
@@ -325,7 +455,6 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
-        // ── Reaction ──────────────────────────────────────────────────────
         case 'reaction':
         case 'remove_reaction': {
           const targetWs = activeConnections.get(message.toUserId);
@@ -335,7 +464,6 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
-        // ── Call Signaling ────────────────────────────────────────────────
         case 'call_offer':
         case 'call_answer':
         case 'call_ice':
@@ -352,7 +480,6 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
-        // ── Block / Unblock ───────────────────────────────────────────────
         case 'block_user':
         case 'notify_blocked': {
           const blockedWs = activeConnections.get(message.blockedUserId || message.toUserId);
@@ -370,7 +497,6 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
-        // ── Mute ──────────────────────────────────────────────────────────
         case 'notify_muted': {
           const mutedWs = activeConnections.get(message.toUserId);
           if (mutedWs && mutedWs.readyState === WebSocket.OPEN) {
@@ -379,14 +505,12 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
-        // ── Report ────────────────────────────────────────────────────────
         case 'report_user': {
-          console.log(`[Report] ${userId} reported ${message.reportedUserId}: ${message.reason} - index.js:384`);
+          console.log(`[Report] ${userId} reported ${message.reportedUserId}: ${message.reason} - index.js:509`);
           ws.send(JSON.stringify({ type: 'report_received', success: true }));
           break;
         }
 
-        // ── Ping ──────────────────────────────────────────────────────────
         case 'ping': {
           if (userId) updateLastSeen(userId);
           ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
@@ -394,10 +518,10 @@ wss.on('connection', (ws, req) => {
         }
 
         default:
-          console.log(`[Unknown] Message type: ${message.type} - index.js:397`);
+          console.log(`[Unknown] Message type: ${message.type} - index.js:521`);
       }
     } catch (e) {
-      console.error('[Error] Processing message: - index.js:400', e.message);
+      console.error('[Error] Processing message: - index.js:524', e.message);
       try { ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' })); } catch (_) {}
     }
   });
@@ -408,12 +532,12 @@ wss.on('connection', (ws, req) => {
       saveUsers();
       activeConnections.delete(userId);
       _broadcastOnlineStatus(userId, username, false);
-      console.log(`[Disconnect] ${username} (${userId}) - index.js:411`);
+      console.log(`[Disconnect] ${username} (${userId}) - index.js:535`);
     }
   });
 
   ws.on('error', (error) => {
-    console.error('[WS Error] - index.js:416', error.message);
+    console.error('[WS Error] - index.js:540', error.message);
   });
 
   ws.send(JSON.stringify({ type: 'connected', message: 'Connected to SecTher Server' }));
@@ -440,6 +564,20 @@ function _broadcastOnlineStatus(uid, uname, isOnline) {
   }
 }
 
+function _broadcastUserDeleted(deletedUserInfo) {
+  const deletedMsg = JSON.stringify({
+    type: 'user_deleted',
+    userId: deletedUserInfo.userId,
+    username: deletedUserInfo.username,
+    accountId: deletedUserInfo.accountId,
+  });
+  for (const [, ws] of activeConnections.entries()) {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(deletedMsg); } catch (_) {}
+    }
+  }
+}
+
 // ─── Heartbeat (30s) ──────────────────────────────────────────────────────────
 setInterval(() => {
   wss.clients.forEach((ws) => {
@@ -449,17 +587,17 @@ setInterval(() => {
   });
 }, 30000);
 
-// ─── 48-Hour Cleanup (runs every hour) ───────────────────────────────────────
+// ─── Cleanup (runs every hour) ───────────────────────────────────────────────
 setInterval(() => {
   cleanupInactiveUsers();
 }, 60 * 60 * 1000);
 
-// Run cleanup on startup too
 setTimeout(cleanupInactiveUsers, 5000);
 
 // ─── Stats (every 5 min) ──────────────────────────────────────────────────────
 setInterval(() => {
-  console.log(`[Stats] Registered: ${users.size} | Online: ${activeConnections.size} - index.js:462`);
+  console.log(`[Stats] Registered: ${users.size} | Online: ${activeConnections.size} - index.js:599`);
 }, 5 * 60 * 1000);
 
-console.log('[Server] Ready for connections - index.js:465');
+console.log('[Server] Ready for connections - index.js:602');
+

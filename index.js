@@ -372,6 +372,7 @@ wss.on('connection', (ws, req) => {
           const results = [];
           
           if (q.length > 0) {
+            // Exact userId match
             const byUserId = userIdToUsername.get(q);
             if (byUserId) {
               const u = users.get(byUserId);
@@ -383,16 +384,53 @@ wss.on('connection', (ws, req) => {
                 online: activeConnections.has(u?.id || q),
               });
             }
+            
+            // Exact accountId match
             const byAccountId = accountIdToUsername.get(q);
-            if (byAccountId && byAccountId !== byUserId) {
+            if (byAccountId) {
               const u = users.get(byAccountId);
-              results.push({
-                username: byAccountId,
-                userId: u?.id || '',
-                accountId: q,
-                publicKey: u?.publicKey || '',
-                online: activeConnections.has(u?.id),
-              });
+              const alreadyAdded = results.some(r => r.userId === u?.id);
+              if (!alreadyAdded && u) {
+                results.push({
+                  username: byAccountId,
+                  userId: u.id,
+                  accountId: u.accountId || '',
+                  publicKey: u.publicKey || '',
+                  online: activeConnections.has(u.id),
+                });
+              }
+            }
+            
+            // Exact username match (search by full username)
+            if (users.has(q)) {
+              const u = users.get(q);
+              const alreadyAdded = results.some(r => r.userId === u?.id);
+              if (!alreadyAdded && u) {
+                results.push({
+                  username: q,
+                  userId: u.id,
+                  accountId: u.accountId || '',
+                  publicKey: u.publicKey || '',
+                  online: activeConnections.has(u.id),
+                });
+              }
+            }
+            
+            // Partial username match (contains)
+            const lowerQuery = q.toLowerCase();
+            for (const [username, userInfo] of users.entries()) {
+              if (username.toLowerCase().includes(lowerQuery)) {
+                const alreadyAdded = results.some(r => r.userId === userInfo.id);
+                if (!alreadyAdded) {
+                  results.push({
+                    username: username,
+                    userId: userInfo.id,
+                    accountId: userInfo.accountId || '',
+                    publicKey: userInfo.publicKey || '',
+                    online: activeConnections.has(userInfo.id),
+                  });
+                }
+              }
             }
           }
           ws.send(JSON.stringify({ type: 'search_results', results }));
@@ -506,7 +544,7 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'report_user': {
-          console.log(`[Report] ${userId} reported ${message.reportedUserId}: ${message.reason} - index.js:509`);
+          console.log(`[Report] ${userId} reported ${message.reportedUserId}: ${message.reason} - index.js:547`);
           ws.send(JSON.stringify({ type: 'report_received', success: true }));
           break;
         }
@@ -518,10 +556,10 @@ wss.on('connection', (ws, req) => {
         }
 
         default:
-          console.log(`[Unknown] Message type: ${message.type} - index.js:521`);
+          console.log(`[Unknown] Message type: ${message.type} - index.js:559`);
       }
     } catch (e) {
-      console.error('[Error] Processing message: - index.js:524', e.message);
+      console.error('[Error] Processing message: - index.js:562', e.message);
       try { ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' })); } catch (_) {}
     }
   });
@@ -532,12 +570,12 @@ wss.on('connection', (ws, req) => {
       saveUsers();
       activeConnections.delete(userId);
       _broadcastOnlineStatus(userId, username, false);
-      console.log(`[Disconnect] ${username} (${userId}) - index.js:535`);
+      console.log(`[Disconnect] ${username} (${userId}) - index.js:573`);
     }
   });
 
   ws.on('error', (error) => {
-    console.error('[WS Error] - index.js:540', error.message);
+    console.error('[WS Error] - index.js:578', error.message);
   });
 
   ws.send(JSON.stringify({ type: 'connected', message: 'Connected to SecTher Server' }));
@@ -596,8 +634,8 @@ setTimeout(cleanupInactiveUsers, 5000);
 
 // ─── Stats (every 5 min) ──────────────────────────────────────────────────────
 setInterval(() => {
-  console.log(`[Stats] Registered: ${users.size} | Online: ${activeConnections.size} - index.js:599`);
+  console.log(`[Stats] Registered: ${users.size} | Online: ${activeConnections.size} - index.js:637`);
 }, 5 * 60 * 1000);
 
-console.log('[Server] Ready for connections - index.js:602');
+console.log('[Server] Ready for connections - index.js:640');
 
